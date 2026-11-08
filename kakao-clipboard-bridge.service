@@ -1,0 +1,14 @@
+[Unit]
+Description=KakaoTalk screenshot clipboard bridge for GNOME and XWayland
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/kakao-clipboard-xwayland.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical-session.target
