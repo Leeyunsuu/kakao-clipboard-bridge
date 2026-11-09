@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/.local/bin/kakao-clipboard-xwayland.py
+ExecStart=%h/.local/bin/kakao-clipboard-bridge
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=5
