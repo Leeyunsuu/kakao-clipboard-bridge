@@ -1,11 +1,18 @@
+#define _GNU_SOURCE
 #include "kakao-png-to-bmp.h"
+#include <fcntl.h>
 #include <glib-unix.h>
 #include <gtk/gtk.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define PNG "image/png"
 #define BMP "image/bmp"
+#define FILE_TRANSFER "application/vnd.portal.filetransfer"
+#define PORTAL_FILES "application/vnd.portal.files"
+#define GNOME_FILES "x-special/gnome-copied-files"
 #define MAX_CLIPBOARD_BYTES (64U * 1024U * 1024U)
 #define MAX_CLIPBOARD_FORMATS 32U
 
@@ -275,11 +282,14 @@ typedef struct {
     GHashTable *contents;
     GInputStream *stream;
     const char *generated_mime;
+    gboolean file_copy;
+    GFile *file;
 } Capture;
 
 static void free_capture(Capture *capture)
 {
     g_clear_object(&capture->stream);
+    g_clear_object(&capture->file);
     g_hash_table_unref(capture->contents);
     g_strfreev(capture->mimes);
     g_object_unref(capture->cancel);
@@ -311,6 +321,151 @@ static void read_part(GTask *task, gpointer clipboard, gpointer data, GCancellab
 }
 
 static void capture_next(Capture *capture);
+
+static void publish_capture(Capture *capture)
+{
+    ScreenshotProvider *provider = g_object_new(screenshot_provider_get_type(), NULL);
+    provider->contents = g_hash_table_ref(capture->contents);
+    provider->generated_mime = capture->generated_mime;
+    GdkContentFormatsBuilder *formats = gdk_content_formats_builder_new();
+    GHashTableIter iterator;
+    gpointer mime;
+    g_hash_table_iter_init(&iterator, capture->contents);
+    while (g_hash_table_iter_next(&iterator, &mime, NULL))
+        gdk_content_formats_builder_add_mime_type(formats, mime);
+    provider->storable = gdk_content_formats_builder_free_to_formats(formats);
+    provider->formats = gdk_content_formats_union(
+        gdk_content_formats_new(&provider->generated_mime, 1), provider->storable);
+    GdkContentProvider *output = GDK_CONTENT_PROVIDER(provider);
+    if (capture->file) {
+        /* The old portal token belongs to the original clipboard owner. */
+        GFile *files[] = {capture->file};
+        GdkFileList *list = gdk_file_list_new_from_array(files, G_N_ELEMENTS(files));
+        GValue value = G_VALUE_INIT;
+        g_value_init(&value, GDK_TYPE_FILE_LIST);
+        g_value_take_boxed(&value, list);
+        GdkContentProvider *file_provider = gdk_content_provider_new_for_value(&value);
+        g_value_unset(&value);
+        output = gdk_content_provider_new_union(
+            (GdkContentProvider *[]) {output, file_provider}, 2);
+    }
+    if (!gdk_clipboard_set_content(capture->clipboard, output))
+        g_warning("Could not offer clipboard image with %s", capture->generated_mime);
+    g_object_unref(output);
+    free_capture(capture);
+}
+
+static GBytes *load_file_image(const char *path, GCancellable *cancel)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+    if (fd < 0)
+        return NULL;
+    struct stat status;
+    if (fstat(fd, &status) || !S_ISREG(status.st_mode) || status.st_size == 0 ||
+        status.st_size > MAX_CLIPBOARD_BYTES) {
+        close(fd);
+        return NULL;
+    }
+
+    guint8 buffer[65536];
+    ssize_t count = read(fd, buffer, 4096);
+    if (count <= 0) {
+        close(fd);
+        return NULL;
+    }
+    g_autofree char *type = g_content_type_guess(NULL, buffer, count, NULL);
+    g_autofree char *mime = g_content_type_get_mime_type(type);
+    gboolean is_png = g_strcmp0(mime, PNG) == 0;
+    if (!is_png && g_strcmp0(mime, BMP) && g_strcmp0(mime, "image/jpeg") &&
+        g_strcmp0(mime, "image/webp")) {
+        close(fd);
+        return NULL;
+    }
+    g_autoptr(GByteArray) bytes = g_byte_array_sized_new(status.st_size);
+    g_byte_array_append(bytes, buffer, count);
+    while (!g_cancellable_is_cancelled(cancel) &&
+           (count = read(fd, buffer, sizeof buffer)) > 0) {
+        if ((gsize)count > MAX_CLIPBOARD_BYTES - bytes->len)
+            break;
+        g_byte_array_append(bytes, buffer, count);
+    }
+    close(fd);
+    if (count != 0 || !bytes->len || g_cancellable_is_cancelled(cancel))
+        return NULL;
+    if (is_png)
+        return g_byte_array_free_to_bytes(g_steal_pointer(&bytes));
+
+    g_autoptr(GBytes) image = g_byte_array_free_to_bytes(g_steal_pointer(&bytes));
+    g_autoptr(GInputStream) stream = g_memory_input_stream_new_from_bytes(image);
+    g_autoptr(GdkPixbuf) pixbuf = gdk_pixbuf_new_from_stream(stream, cancel, NULL);
+    if (!pixbuf || (guint64)gdk_pixbuf_get_width(pixbuf) * gdk_pixbuf_get_height(pixbuf) > 64000000 ||
+        g_cancellable_is_cancelled(cancel))
+        return NULL;
+    g_autoptr(GdkPixbuf) oriented = gdk_pixbuf_apply_embedded_orientation(pixbuf);
+    if (!oriented)
+        return NULL;
+    g_autofree char *png = NULL;
+    gsize length;
+    if (!gdk_pixbuf_save_to_buffer(oriented, &png, &length, "png", NULL, "compression", "1", NULL) ||
+        length > MAX_CLIPBOARD_BYTES)
+        return NULL;
+    return g_bytes_new_take(g_steal_pointer(&png), length);
+}
+
+static GBytes *retrieve_file_image(Capture *capture, GCancellable *cancel)
+{
+    GBytes *copy = g_hash_table_lookup(capture->contents, GNOME_FILES);
+    GBytes *transfer = g_hash_table_lookup(capture->contents, FILE_TRANSFER);
+    gsize length;
+    const char *marker = g_bytes_get_data(copy, &length);
+    const char *token = g_bytes_get_data(transfer, NULL);
+    if (length < 5 || memcmp(marker, "copy\n", 5) != 0 ||
+        !g_bytes_get_size(transfer) || g_bytes_get_size(transfer) > 256)
+        return NULL;
+    g_autofree char *key = g_strndup(token, g_bytes_get_size(transfer));
+    if (!*key || !g_utf8_validate(key, -1, NULL))
+        return NULL;
+
+    g_autoptr(GDBusConnection) bus = g_bus_get_sync(G_BUS_TYPE_SESSION, cancel, NULL);
+    if (!bus)
+        return NULL;
+    g_autoptr(GVariant) response = g_dbus_connection_call_sync(
+        bus, "org.freedesktop.portal.Documents", "/org/freedesktop/portal/documents",
+        "org.freedesktop.portal.FileTransfer", "RetrieveFiles",
+        g_variant_new("(sa{sv})", key, NULL), G_VARIANT_TYPE("(as)"),
+        G_DBUS_CALL_FLAGS_NONE, 3000, cancel, NULL);
+    if (!response)
+        return NULL;
+    g_auto(GStrv) files = NULL;
+    g_variant_get(response, "(^as)", &files);
+    if (!files[0] || files[1] || !g_path_is_absolute(files[0]))
+        return NULL;
+    GBytes *png = load_file_image(files[0], cancel);
+    if (png)
+        capture->file = g_file_new_for_path(files[0]);
+    return png;
+}
+
+static void resolve_file_copy(GTask *task, gpointer clipboard, gpointer data, GCancellable *cancel)
+{
+    (void)clipboard;
+    g_task_return_pointer(task, retrieve_file_image(data, cancel), (GDestroyNotify)g_bytes_unref);
+}
+
+static void file_copy_ready(GObject *clipboard, GAsyncResult *result, gpointer data)
+{
+    (void)clipboard;
+    Capture *capture = data;
+    GBytes *png = g_task_propagate_pointer(G_TASK(result), NULL);
+    if (!png || capture->cancel != current_read) {
+        g_clear_pointer(&png, g_bytes_unref);
+        free_capture(capture);
+        return;
+    }
+    g_hash_table_remove(capture->contents, FILE_TRANSFER);
+    g_hash_table_insert(capture->contents, g_strdup(PNG), png);
+    publish_capture(capture);
+}
 
 static void part_ready(GObject *clipboard, GAsyncResult *result, gpointer data)
 {
@@ -366,17 +521,13 @@ static void capture_next(Capture *capture)
         return;
     }
 
-    /* Claim the selection only after every original representation is available. */
-    ScreenshotProvider *provider = g_object_new(screenshot_provider_get_type(), NULL);
-    provider->contents = g_hash_table_ref(capture->contents);
-    provider->generated_mime = capture->generated_mime;
-    provider->storable = gdk_content_formats_new((const char **)capture->mimes, capture->index);
-    provider->formats = gdk_content_formats_union(
-        gdk_content_formats_new(&provider->generated_mime, 1), provider->storable);
-    if (!gdk_clipboard_set_content(capture->clipboard, GDK_CONTENT_PROVIDER(provider)))
-        g_warning("Could not offer clipboard image with %s", provider->generated_mime);
-    g_object_unref(provider);
-    free_capture(capture);
+    if (capture->file_copy) {
+        g_autoptr(GTask) task = g_task_new(capture->clipboard, capture->cancel, file_copy_ready, capture);
+        g_task_set_task_data(task, capture, NULL);
+        g_task_run_in_thread(task, resolve_file_copy);
+    } else {
+        publish_capture(capture);
+    }
 }
 
 static void clipboard_changed(GdkClipboard *clipboard, gpointer unused)
@@ -393,19 +544,27 @@ static void clipboard_changed(GdkClipboard *clipboard, gpointer unused)
     const char *const *mimes = gdk_content_formats_get_mime_types(formats, &count);
     gboolean has_png = gdk_content_formats_contain_mime_type(formats, PNG);
     gboolean has_bmp = gdk_content_formats_contain_mime_type(formats, BMP);
-    if (count > MAX_CLIPBOARD_FORMATS || has_png == has_bmp ||
-        gdk_content_formats_contain_mime_type(formats, "application/vnd.portal.filetransfer") ||
-        gdk_content_formats_contain_mime_type(formats, "x-special/gnome-copied-files"))
+    gboolean has_transfer = gdk_content_formats_contain_mime_type(formats, FILE_TRANSFER);
+    gboolean has_gnome_files = gdk_content_formats_contain_mime_type(formats, GNOME_FILES);
+    gboolean file_copy = !has_png && !has_bmp && has_transfer && has_gnome_files;
+    if (count > MAX_CLIPBOARD_FORMATS ||
+        (!file_copy && (has_png == has_bmp || has_transfer || has_gnome_files)))
         return;
     current_read = g_cancellable_new();
     Capture *capture = g_new0(Capture, 1);
-    capture->generated_mime = has_png ? BMP : PNG;
+    capture->generated_mime = has_png || file_copy ? BMP : PNG;
+    capture->file_copy = file_copy;
     capture->clipboard = g_object_ref(clipboard);
     capture->cancel = g_object_ref(current_read);
-    capture->mimes = g_new0(char *, count + 1);
-    for (gsize i = 0; i < count; i++)
-        capture->mimes[i] = g_strdup(mimes[i]);
-    capture->remaining = MAX_CLIPBOARD_BYTES;
+    if (file_copy) {
+        capture->mimes = g_strdupv((char *[]) {GNOME_FILES, FILE_TRANSFER, NULL});
+        capture->remaining = 65536;
+    } else {
+        capture->mimes = g_new0(char *, count + 1);
+        for (gsize i = 0; i < count; i++)
+            capture->mimes[i] = g_strdup(mimes[i]);
+        capture->remaining = MAX_CLIPBOARD_BYTES;
+    }
     capture->contents = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_bytes_unref);
     capture_next(capture);
 }
