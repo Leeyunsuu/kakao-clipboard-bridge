@@ -2,6 +2,7 @@
 #include <glib-unix.h>
 #include <gtk/gtk.h>
 #include <signal.h>
+#include <string.h>
 
 #define PNG "image/png"
 #define BMP "image/bmp"
@@ -13,6 +14,7 @@ typedef struct {
     GHashTable *contents;
     GdkContentFormats *formats;
     GdkContentFormats *storable;
+    const char *generated_mime;
 } ScreenshotProvider;
 
 typedef GdkContentProviderClass ScreenshotProviderClass;
@@ -20,21 +22,21 @@ G_DEFINE_TYPE(ScreenshotProvider, screenshot_provider, GDK_TYPE_CONTENT_PROVIDER
 
 typedef struct {
     GOutputStream *stream;
-    GBytes *bmp;
+    GBytes *converted;
     GCancellable *caller;
     GCancellable *cancel;
     gulong cancel_handler;
     guint timeout;
     int priority;
     gint64 started;
-    gboolean is_bmp;
+    const char *generated_mime;
 } WriteRequest;
 
-static GQueue bmp_queue = G_QUEUE_INIT;
-static gboolean bmp_busy;
+static GQueue conversion_queue = G_QUEUE_INIT;
+static gboolean conversion_busy;
 static GCancellable *current_read;
 
-static void start_next_bmp(void);
+static void start_next_conversion(void);
 
 static void cancel_write(GCancellable *caller, gpointer data)
 {
@@ -60,30 +62,30 @@ static void free_write(gpointer data)
     g_clear_object(&write->caller);
     g_object_unref(write->cancel);
     g_object_unref(write->stream);
-    g_clear_pointer(&write->bmp, g_bytes_unref);
+    g_clear_pointer(&write->converted, g_bytes_unref);
     g_free(write);
 }
 
 static void finish_write(GTask *task, GError *error)
 {
     WriteRequest *write = g_task_get_task_data(task);
-    gboolean is_bmp = write->is_bmp;
+    const char *generated_mime = write->generated_mime;
     if (error) {
         if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
             g_warning("Could not serve clipboard image: %s", error->message);
         g_task_return_error(task, error);
     } else {
-        if (is_bmp)
-            g_message("Served requested BMP (%" G_GINT64_FORMAT " ms)",
+        if (generated_mime)
+            g_message("Served requested %s (%" G_GINT64_FORMAT " ms)", generated_mime,
                       (g_get_monotonic_time() - write->started) / 1000);
         g_task_return_boolean(task, TRUE);
     }
     /* Release the decoded image before allowing a second conversion. */
-    g_clear_pointer(&write->bmp, g_bytes_unref);
+    g_clear_pointer(&write->converted, g_bytes_unref);
     g_object_unref(task);
-    if (is_bmp) {
-        bmp_busy = FALSE;
-        start_next_bmp();
+    if (generated_mime) {
+        conversion_busy = FALSE;
+        start_next_conversion();
     }
 }
 
@@ -103,44 +105,86 @@ static void send_bytes(GTask *task, GBytes *bytes)
                                     write->cancel, write_done, task);
 }
 
-static void decode_bmp(GTask *task, gpointer source, gpointer unused, GCancellable *cancel)
+static guint32 read_le32(const guint8 *bytes)
+{
+    guint32 value;
+    memcpy(&value, bytes, sizeof value);
+    return GUINT32_FROM_LE(value);
+}
+
+static GBytes *bmp_to_png(GBytes *bmp, GCancellable *cancel, GError **error)
+{
+    gsize length;
+    const guint8 *data = g_bytes_get_data(bmp, &length);
+    /* Wine exports a BMP file header followed by a Windows DIB. Limit the
+     * decoded image size before handing it to the image loader. */
+    if (length < 54 || data[0] != 'B' || data[1] != 'M' ||
+        read_le32(data + 14) < 40 || read_le32(data + 14) > length - 14) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Invalid Windows BMP header");
+        return NULL;
+    }
+    gint64 width = (gint32)read_le32(data + 18);
+    gint64 height = (gint32)read_le32(data + 22);
+    if (height < 0)
+        height = -height;
+    if (width <= 0 || height == 0 || width > 16384 || height > 16384 ||
+        width * height > 64000000) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "BMP exceeds image size limit");
+        return NULL;
+    }
+
+    g_autoptr(GInputStream) input = g_memory_input_stream_new_from_bytes(bmp);
+    g_autoptr(GdkPixbuf) pixbuf = gdk_pixbuf_new_from_stream(input, cancel, error);
+    if (!pixbuf || g_cancellable_set_error_if_cancelled(cancel, error))
+        return NULL;
+    char *png = NULL;
+    gsize size;
+    /* A low compression level saves CPU without changing the decoded pixels. */
+    if (!gdk_pixbuf_save_to_buffer(pixbuf, &png, &size, "png", error, "compression", "1", NULL))
+        return NULL;
+    return g_bytes_new_take(png, size);
+}
+
+static void convert_image(GTask *task, gpointer source, gpointer unused, GCancellable *cancel)
 {
     (void)unused;
     ScreenshotProvider *provider = source;
     GError *error = NULL;
-    GBytes *png = g_hash_table_lookup(provider->contents, PNG);
-    GBytes *bmp = kakao_png_to_bmp(png, cancel, &error);
-    if (bmp)
-        g_task_return_pointer(task, bmp, (GDestroyNotify)g_bytes_unref);
+    gboolean to_bmp = g_str_equal(provider->generated_mime, BMP);
+    GBytes *original = g_hash_table_lookup(provider->contents, to_bmp ? PNG : BMP);
+    GBytes *converted = to_bmp ? kakao_png_to_bmp(original, cancel, &error)
+                               : bmp_to_png(original, cancel, &error);
+    if (converted)
+        g_task_return_pointer(task, converted, (GDestroyNotify)g_bytes_unref);
     else
         g_task_return_error(task, error);
 }
 
-static void bmp_ready(GObject *provider, GAsyncResult *result, gpointer data)
+static void conversion_ready(GObject *provider, GAsyncResult *result, gpointer data)
 {
     (void)provider;
     GTask *task = data;
     WriteRequest *write = g_task_get_task_data(task);
     GError *error = NULL;
-    write->bmp = g_task_propagate_pointer(G_TASK(result), &error);
-    if (write->bmp)
-        send_bytes(task, write->bmp);
+    write->converted = g_task_propagate_pointer(G_TASK(result), &error);
+    if (write->converted)
+        send_bytes(task, write->converted);
     else
         finish_write(task, error);
 }
 
-static void start_next_bmp(void)
+static void start_next_conversion(void)
 {
-    while (!bmp_busy && !g_queue_is_empty(&bmp_queue)) {
-        GTask *task = g_queue_pop_head(&bmp_queue);
+    while (!conversion_busy && !g_queue_is_empty(&conversion_queue)) {
+        GTask *task = g_queue_pop_head(&conversion_queue);
         if (g_task_return_error_if_cancelled(task)) {
             g_object_unref(task);
             continue;
         }
-        bmp_busy = TRUE;
+        conversion_busy = TRUE;
         g_autoptr(GTask) decode = g_task_new(g_task_get_source_object(task),
-                                             g_task_get_cancellable(task), bmp_ready, task);
-        g_task_run_in_thread(decode, decode_bmp);
+                                             g_task_get_cancellable(task), conversion_ready, task);
+        g_task_run_in_thread(decode, convert_image);
     }
 }
 
@@ -148,14 +192,15 @@ static void provider_write(GdkContentProvider *provider, const char *mime,
                            GOutputStream *stream, int priority, GCancellable *caller,
                            GAsyncReadyCallback callback, gpointer data)
 {
-    gboolean is_bmp = g_str_equal(mime, BMP);
-    GBytes *original = g_hash_table_lookup(((ScreenshotProvider *)provider)->contents, mime);
+    ScreenshotProvider *image = (ScreenshotProvider *)provider;
+    GBytes *original = g_hash_table_lookup(image->contents, mime);
+    gboolean generate = !original && g_str_equal(mime, image->generated_mime);
     g_autoptr(GCancellable) cancel = g_cancellable_new();
     GTask *task = g_task_new(provider, cancel, callback, data);
     g_task_set_priority(task, priority);
-    if ((!is_bmp && !original) || (is_bmp && bmp_queue.length >= 4)) {
-        g_task_return_new_error(task, G_IO_ERROR, is_bmp ? G_IO_ERROR_BUSY : G_IO_ERROR_NOT_SUPPORTED,
-                                "%s", is_bmp ? "Too many BMP requests" : "Unsupported clipboard format");
+    if ((!generate && !original) || (generate && conversion_queue.length >= 4)) {
+        g_task_return_new_error(task, G_IO_ERROR, generate ? G_IO_ERROR_BUSY : G_IO_ERROR_NOT_SUPPORTED,
+                                "%s", generate ? "Too many image conversion requests" : "Unsupported clipboard format");
         g_object_unref(task);
         return;
     }
@@ -165,16 +210,16 @@ static void provider_write(GdkContentProvider *provider, const char *mime,
     write->cancel = g_object_ref(cancel);
     write->priority = priority;
     write->started = g_get_monotonic_time();
-    write->is_bmp = is_bmp;
+    write->generated_mime = generate ? image->generated_mime : NULL;
     if (caller) {
         write->caller = g_object_ref(caller);
         write->cancel_handler = g_cancellable_connect(caller, G_CALLBACK(cancel_write), cancel, NULL);
     }
     write->timeout = g_timeout_add_seconds(15, time_out_write, write);
     g_task_set_task_data(task, write, free_write);
-    if (is_bmp) {
-        g_queue_push_tail(&bmp_queue, task);
-        start_next_bmp();
+    if (generate) {
+        g_queue_push_tail(&conversion_queue, task);
+        start_next_conversion();
     } else if (g_bytes_get_size(original)) {
         send_bytes(task, original);
     } else {
@@ -229,6 +274,7 @@ typedef struct {
     gsize remaining;
     GHashTable *contents;
     GInputStream *stream;
+    const char *generated_mime;
 } Capture;
 
 static void free_capture(Capture *capture)
@@ -279,7 +325,8 @@ static void part_ready(GObject *clipboard, GAsyncResult *result, gpointer data)
         free_capture(capture);
         return;
     }
-    if (g_str_equal(capture->mimes[capture->index], PNG) && g_bytes_get_size(bytes) == 0) {
+    const char *original_mime = g_str_equal(capture->generated_mime, BMP) ? PNG : BMP;
+    if (g_str_equal(capture->mimes[capture->index], original_mime) && g_bytes_get_size(bytes) == 0) {
         g_bytes_unref(bytes);
         free_capture(capture);
         return;
@@ -322,11 +369,12 @@ static void capture_next(Capture *capture)
     /* Claim the selection only after every original representation is available. */
     ScreenshotProvider *provider = g_object_new(screenshot_provider_get_type(), NULL);
     provider->contents = g_hash_table_ref(capture->contents);
+    provider->generated_mime = capture->generated_mime;
     provider->storable = gdk_content_formats_new((const char **)capture->mimes, capture->index);
     provider->formats = gdk_content_formats_union(
-        gdk_content_formats_new((const char *[]) {BMP}, 1), provider->storable);
+        gdk_content_formats_new(&provider->generated_mime, 1), provider->storable);
     if (!gdk_clipboard_set_content(capture->clipboard, GDK_CONTENT_PROVIDER(provider)))
-        g_warning("Could not offer clipboard image with BMP");
+        g_warning("Could not offer clipboard image with %s", provider->generated_mime);
     g_object_unref(provider);
     free_capture(capture);
 }
@@ -343,14 +391,15 @@ static void clipboard_changed(GdkClipboard *clipboard, gpointer unused)
     gsize count;
     GdkContentFormats *formats = gdk_clipboard_get_formats(clipboard);
     const char *const *mimes = gdk_content_formats_get_mime_types(formats, &count);
-    if (count > MAX_CLIPBOARD_FORMATS ||
-        !gdk_content_formats_contain_mime_type(formats, PNG) ||
-        gdk_content_formats_contain_mime_type(formats, BMP) ||
+    gboolean has_png = gdk_content_formats_contain_mime_type(formats, PNG);
+    gboolean has_bmp = gdk_content_formats_contain_mime_type(formats, BMP);
+    if (count > MAX_CLIPBOARD_FORMATS || has_png == has_bmp ||
         gdk_content_formats_contain_mime_type(formats, "application/vnd.portal.filetransfer") ||
         gdk_content_formats_contain_mime_type(formats, "x-special/gnome-copied-files"))
         return;
     current_read = g_cancellable_new();
     Capture *capture = g_new0(Capture, 1);
+    capture->generated_mime = has_png ? BMP : PNG;
     capture->clipboard = g_object_ref(clipboard);
     capture->cancel = g_object_ref(current_read);
     capture->mimes = g_new0(char *, count + 1);
@@ -379,7 +428,7 @@ int main(void)
     g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
     g_unix_signal_add(SIGTERM, stop, loop);
     g_unix_signal_add(SIGINT, stop, loop);
-    g_message("Listening for clipboard images with PNG on XWayland");
+    g_message("Listening for clipboard images with PNG or BMP on XWayland");
     g_main_loop_run(loop);
     return 0;
 }
